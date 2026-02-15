@@ -1,361 +1,291 @@
-from flask import Flask, request, jsonify, render_template
+import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-from sklearn.preprocessing import LabelEncoder
 import os
+from sklearn.preprocessing import LabelEncoder
+import traceback
 
-app = Flask(__name__)
+# Page configuration
+st.set_page_config(
+    page_title="Developer Recommendation System",
+    page_icon="👨‍💻",
+    layout="wide"
+)
 
-# Global variables for model and encoders
-model = None
-label_encoders = {}
-feature_columns = [
-    "project_type", 
-    "required_seniority", 
-    "dev_specialty", 
-    "dev_seniority", 
-    "dev_workload", 
-    "dev_on_leave", 
-    "dev_tasks_this_week"
-]
+# Title and description
+st.title("👨‍💻 Developer Recommendation System")
+st.markdown("---")
 
-def load_model():
+# Hard rule warning
+st.warning("⚠️ **HARD RULE**: Developer on leave can NEVER be recommended")
+
+# Initialize session state for model and encoders
+if 'model_loaded' not in st.session_state:
+    st.session_state.model_loaded = False
+    st.session_state.model = None
+    st.session_state.label_encoders = None
+
+# Function to load model with error handling
+@st.cache_resource
+def load_model_and_encoders():
     """Load the trained model and label encoders"""
-    global model, label_encoders
-    
     try:
-        # Load the trained model
-        model = joblib.load("dev_recommender_model.pkl")
-        print("✅ Model loaded successfully")
+        # Check if model file exists
+        if not os.path.exists("dev_recommender_model.pkl"):
+            st.error("❌ Model file 'dev_recommender_model.pkl' not found!")
+            return None, None
         
-        # Load label encoders (if saved separately)
-        # For now, we'll recreate them based on the training data
-        # You might want to save and load the encoders as well
+        # Load model
+        model = joblib.load("dev_recommender_model.pkl")
+        
+        # Load label encoders (create dummy if not exists)
         if os.path.exists("label_encoders.pkl"):
             label_encoders = joblib.load("label_encoders.pkl")
-            print("✅ Label encoders loaded successfully")
         else:
-            print("⚠️ Label encoders file not found. You may need to fit encoders with training data.")
-            
-    except FileNotFoundError:
-        print("❌ Model file not found. Please train the model first.")
-        model = None
+            # Create dummy encoders if not available
+            st.warning("⚠️ Label encoders not found. Using default encoding.")
+            label_encoders = create_dummy_encoders()
+        
+        return model, label_encoders
+    
     except Exception as e:
-        print(f"❌ Error loading model: {str(e)}")
-        model = None
+        st.error(f"❌ Error loading model: {str(e)}")
+        st.code(traceback.format_exc())
+        return None, None
 
-def encode_input_data(input_df):
-    """Encode categorical columns using label encoders"""
-    encoded_df = input_df.copy()
+def create_dummy_encoders():
+    """Create dummy label encoders if real ones aren't available"""
+    encoders = {}
     
-    for col in encoded_df.columns:
-        if col in label_encoders and col != 'dev_on_leave':
-            try:
-                encoded_df[col] = label_encoders[col].transform(encoded_df[col])
-            except (ValueError, KeyError) as e:
-                # Handle unseen labels by assigning a default value
-                print(f"Warning: Unseen label in column {col}: {encoded_df[col].iloc[0]}")
-                # You might want to handle this differently based on your requirements
-                encoded_df[col] = -1  # or some default value
+    # Define possible values for each categorical column
+    categories = {
+        "project_type": ["web", "app", "game"],
+        "required_seniority": ["junior", "mid", "senior"],
+        "dev_specialty": ["web", "app", "game"],
+        "dev_seniority": ["junior", "mid", "senior"],
+        "dev_workload": ["free", "light", "medium", "heavy"]
+    }
     
-    return encoded_df
+    for col, values in categories.items():
+        le = LabelEncoder()
+        le.fit(values)
+        encoders[col] = le
+    
+    return encoders
 
-def predict_with_rules(sample_dict):
+def predict_with_rules(sample_dict, model, label_encoders):
     """
     Make prediction with hard rules
-    Returns: 1 for recommended, 0 for not recommended
+    Returns: 1 for recommended, 0 for not recommended, and reason
     """
     # HARD RULE: on leave can NEVER be recommended
-    if sample_dict.get("dev_on_leave") == True or sample_dict.get("dev_on_leave") == "True":
-        return 0
+    if sample_dict.get("dev_on_leave") == True or sample_dict.get("dev_on_leave") == "True" or sample_dict.get("dev_on_leave") == "Yes":
+        return 0, "Hard Rule: Developer is on leave"
     
-    # If model is not loaded, return None or handle appropriately
+    # Check if model is loaded
     if model is None:
-        raise Exception("Model not loaded")
+        return 0, "Model not loaded"
     
-    # Convert to DataFrame
-    temp_df = pd.DataFrame([sample_dict])
-    
-    # Encode categorical columns
-    temp_df_encoded = encode_input_data(temp_df)
-    
-    # Make prediction
-    prediction = model.predict(temp_df_encoded)[0]
-    
-    return int(prediction)
-
-@app.route('/')
-def home():
-    """Render the home page"""
-    return render_template('index.html')
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    """API endpoint for making predictions"""
     try:
-        # Get data from request
-        if request.is_json:
-            data = request.get_json()
+        # Convert to DataFrame
+        temp_df = pd.DataFrame([sample_dict])
+        
+        # Encode categorical columns
+        for col in temp_df.columns:
+            if col in label_encoders and col != 'dev_on_leave' and col in temp_df.columns:
+                try:
+                    temp_df[col] = label_encoders[col].transform(temp_df[col])
+                except Exception as e:
+                    # If encoding fails, use a default value
+                    st.warning(f"Encoding issue with column {col}: {str(e)}")
+                    temp_df[col] = 0  # Default value
+        
+        # Make prediction
+        prediction = model.predict(temp_df)[0]
+        
+        # Add reasoning
+        if prediction == 1:
+            reason = "ML model recommends this developer"
         else:
-            data = request.form.to_dict()
+            # Try to determine why
+            if sample_dict["project_type"] != sample_dict["dev_specialty"]:
+                reason = f"Specialty mismatch: Need {sample_dict['project_type']}, Have {sample_dict['dev_specialty']}"
+            elif sample_dict["required_seniority"] == "senior" and sample_dict["dev_seniority"] == "mid":
+                reason = "Under-qualified: Need senior, have mid"
+            elif sample_dict["dev_workload"] == "heavy" or sample_dict["dev_tasks_this_week"] >= 4:
+                reason = "Overloaded: Too many tasks or heavy workload"
+            else:
+                reason = "ML model does not recommend this developer"
         
-        # Convert boolean string to actual boolean
-        if 'dev_on_leave' in data:
-            if isinstance(data['dev_on_leave'], str):
-                data['dev_on_leave'] = data['dev_on_leave'].lower() == 'true'
-        
-        # Convert tasks to integer
-        if 'dev_tasks_this_week' in data:
-            data['dev_tasks_this_week'] = int(data['dev_tasks_this_week'])
-        
-        # Make prediction with hard rules
-        result = predict_with_rules(data)
-        
-        # Prepare response
-        response = {
-            'success': True,
-            'recommendation': result,
-            'message': '✅ Recommended Developer' if result == 1 else '❌ Not Recommended',
-            'hard_rule_applied': data.get('dev_on_leave', False)
-        }
-        
-        if request.is_json:
-            return jsonify(response)
-        else:
-            return render_template('result.html', result=response)
-            
+        return int(prediction), reason
+    
     except Exception as e:
-        error_response = {
-            'success': False,
-            'error': str(e)
-        }
-        if request.is_json:
-            return jsonify(error_response), 400
-        else:
-            return render_template('error.html', error=str(e))
+        st.error(f"Prediction error: {str(e)}")
+        return 0, f"Error in prediction: {str(e)}"
 
-@app.route('/batch_predict', methods=['POST'])
-def batch_predict():
-    """API endpoint for batch predictions"""
-    try:
-        data = request.get_json()
-        
-        if not isinstance(data, list):
-            return jsonify({'error': 'Expected a list of samples'}), 400
-        
-        results = []
-        for sample in data:
-            # Convert boolean string to actual boolean
-            if 'dev_on_leave' in sample:
-                if isinstance(sample['dev_on_leave'], str):
-                    sample['dev_on_leave'] = sample['dev_on_leave'].lower() == 'true'
+# Load model
+with st.spinner("Loading model..."):
+    model, label_encoders = load_model_and_encoders()
+
+if model is not None:
+    st.success("✅ Model loaded successfully!")
+    st.session_state.model_loaded = True
+    st.session_state.model = model
+    st.session_state.label_encoders = label_encoders
+
+# Test cases
+st.header("📊 Test Cases Results")
+
+test_cases = [
+    # 1. Perfect match
+    {
+        "name": "Perfect Match",
+        "data": {
+            "project_type": "web",
+            "required_seniority": "mid",
+            "dev_specialty": "web",
+            "dev_seniority": "senior",
+            "dev_workload": "light",
+            "dev_on_leave": False,
+            "dev_tasks_this_week": 1
+        }
+    },
+    # 2. Wrong specialty
+    {
+        "name": "Wrong Specialty",
+        "data": {
+            "project_type": "game",
+            "required_seniority": "mid",
+            "dev_specialty": "web",
+            "dev_seniority": "senior",
+            "dev_workload": "free",
+            "dev_on_leave": False,
+            "dev_tasks_this_week": 0
+        }
+    },
+    # 3. On leave (hard rule)
+    {
+        "name": "On Leave (Hard Rule)",
+        "data": {
+            "project_type": "app",
+            "required_seniority": "junior",
+            "dev_specialty": "app",
+            "dev_seniority": "junior",
+            "dev_workload": "free",
+            "dev_on_leave": True,
+            "dev_tasks_this_week": 0
+        }
+    },
+    # 4. Under-qualified
+    {
+        "name": "Under-qualified",
+        "data": {
+            "project_type": "web",
+            "required_seniority": "senior",
+            "dev_specialty": "web",
+            "dev_seniority": "mid",
+            "dev_workload": "free",
+            "dev_on_leave": False,
+            "dev_tasks_this_week": 1
+        }
+    },
+    # 5. Overloaded
+    {
+        "name": "Overloaded",
+        "data": {
+            "project_type": "game",
+            "required_seniority": "mid",
+            "dev_specialty": "game",
+            "dev_seniority": "senior",
+            "dev_workload": "heavy",
+            "dev_on_leave": False,
+            "dev_tasks_this_week": 5
+        }
+    }
+]
+
+# Create columns for grid display
+cols = st.columns(2)
+
+for idx, test_case in enumerate(test_cases):
+    with cols[idx % 2]:
+        with st.container():
+            st.subheader(f"Case {idx+1}: {test_case['name']}")
             
-            # Convert tasks to integer
-            if 'dev_tasks_this_week' in sample:
-                sample['dev_tasks_this_week'] = int(sample['dev_tasks_this_week'])
+            # Display input data
+            with st.expander("View Input Data"):
+                st.json(test_case['data'])
             
             # Make prediction
-            result = predict_with_rules(sample)
-            results.append({
-                'input': sample,
-                'recommendation': result,
-                'message': '✅ Recommended' if result == 1 else '❌ Not Recommended'
-            })
-        
-        return jsonify({
-            'success': True,
-            'results': results
+            if st.session_state.model_loaded:
+                result, reason = predict_with_rules(
+                    test_case['data'], 
+                    st.session_state.model, 
+                    st.session_state.label_encoders
+                )
+                
+                # Display result with color
+                if result == 1:
+                    st.success(f"✅ **RECOMMENDED**")
+                    st.caption(f"Reason: {reason}")
+                else:
+                    st.error(f"❌ **NOT RECOMMENDED**")
+                    st.caption(f"Reason: {reason}")
+            else:
+                st.warning("Model not loaded. Cannot make prediction.")
+            
+            st.markdown("---")
+
+# Summary Table
+st.header("📈 Summary")
+
+if st.session_state.model_loaded:
+    results_data = []
+    for idx, test_case in enumerate(test_cases):
+        result, reason = predict_with_rules(
+            test_case['data'], 
+            st.session_state.model, 
+            st.session_state.label_encoders
+        )
+        results_data.append({
+            "Case": f"Case {idx+1}",
+            "Description": test_case['name'],
+            "Result": "✅ Recommended" if result == 1 else "❌ Not Recommended",
+            "Reason": reason
         })
-        
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
+    
+    results_df = pd.DataFrame(results_data)
+    st.dataframe(results_df, use_container_width=True)
+    
+    # Statistics
+    st.header("📊 Statistics")
+    
+    total = len(results_data)
+    recommended = sum(1 for r in results_data if "✅" in r["Result"])
+    not_recommended = total - recommended
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Cases", total)
+    with col2:
+        st.metric("✅ Recommended", recommended)
+    with col3:
+        st.metric("❌ Not Recommended", not_recommended)
+    with col4:
+        rate = (recommended/total)*100
+        st.metric("Recommendation Rate", f"{rate:.1f}%")
+    
+    # Progress bar
+    st.progress(recommended/total)
+else:
+    st.warning("⚠️ Model not loaded. Please check the model files.")
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'model_loaded': model is not None
-    })
-
-# Create templates directory and HTML files if they don't exist
-def create_templates():
-    """Create basic HTML templates for the web interface"""
-    import os
-    
-    templates_dir = 'templates'
-    if not os.path.exists(templates_dir):
-        os.makedirs(templates_dir)
-    
-    # Create index.html
-    index_html = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Developer Recommendation System</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        select, input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
-        button { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
-        button:hover { background-color: #45a049; }
-        .note { color: #666; font-size: 0.9em; margin-top: 20px; }
-        .hard-rule { color: #ff0000; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <h1>Developer Recommendation System</h1>
-    <p class="hard-rule">⚠️ Hard Rule: Developer on leave can NEVER be recommended</p>
-    
-    <form action="/predict" method="post">
-        <div class="form-group">
-            <label for="project_type">Project Type:</label>
-            <select name="project_type" id="project_type" required>
-                <option value="web">Web</option>
-                <option value="app">App</option>
-                <option value="game">Game</option>
-            </select>
-        </div>
-        
-        <div class="form-group">
-            <label for="required_seniority">Required Seniority:</label>
-            <select name="required_seniority" id="required_seniority" required>
-                <option value="junior">Junior</option>
-                <option value="mid">Mid</option>
-                <option value="senior">Senior</option>
-            </select>
-        </div>
-        
-        <div class="form-group">
-            <label for="dev_specialty">Developer Specialty:</label>
-            <select name="dev_specialty" id="dev_specialty" required>
-                <option value="web">Web</option>
-                <option value="app">App</option>
-                <option value="game">Game</option>
-            </select>
-        </div>
-        
-        <div class="form-group">
-            <label for="dev_seniority">Developer Seniority:</label>
-            <select name="dev_seniority" id="dev_seniority" required>
-                <option value="junior">Junior</option>
-                <option value="mid">Mid</option>
-                <option value="senior">Senior</option>
-            </select>
-        </div>
-        
-        <div class="form-group">
-            <label for="dev_workload">Developer Workload:</label>
-            <select name="dev_workload" id="dev_workload" required>
-                <option value="free">Free</option>
-                <option value="light">Light</option>
-                <option value="medium">Medium</option>
-                <option value="heavy">Heavy</option>
-            </select>
-        </div>
-        
-        <div class="form-group">
-            <label for="dev_on_leave">Developer on Leave:</label>
-            <select name="dev_on_leave" id="dev_on_leave" required>
-                <option value="false">No</option>
-                <option value="true">Yes</option>
-            </select>
-        </div>
-        
-        <div class="form-group">
-            <label for="dev_tasks_this_week">Tasks This Week:</label>
-            <input type="number" name="dev_tasks_this_week" id="dev_tasks_this_week" min="0" max="10" value="0" required>
-        </div>
-        
-        <button type="submit">Get Recommendation</button>
-    </form>
-    
-    <div class="note">
-        <p><strong>Note:</strong> This system uses a trained Random Forest model with hard rules.</p>
-    </div>
-</body>
-</html>
-    '''
-    
-    # Create result.html
-    result_html = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Recommendation Result</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; text-align: center; }
-        .result-box { padding: 20px; margin: 20px 0; border-radius: 5px; }
-        .recommended { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .not-recommended { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .hard-rule { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; padding: 10px; margin-top: 20px; }
-        .button { display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px; margin-top: 20px; }
-        .button:hover { background-color: #0056b3; }
-    </style>
-</head>
-<body>
-    <h1>Recommendation Result</h1>
-    
-    <div class="result-box {{ 'recommended' if result.recommendation == 1 else 'not-recommended' }}">
-        <h2>{{ result.message }}</h2>
-    </div>
-    
-    {% if result.hard_rule_applied %}
-    <div class="hard-rule">
-        <strong>⚠️ Hard Rule Applied:</strong> Developer on leave cannot be recommended.
-    </div>
-    {% endif %}
-    
-    <a href="/" class="button">Make Another Prediction</a>
-</body>
-</html>
-    '''
-    
-    # Create error.html
-    error_html = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Error</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; text-align: center; }
-        .error-box { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; padding: 20px; border-radius: 5px; margin: 20px 0; }
-        .button { display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px; margin-top: 20px; }
-    </style>
-</head>
-<body>
-    <h1>Error</h1>
-    
-    <div class="error-box">
-        <h2>Something went wrong!</h2>
-        <p>{{ error }}</p>
-    </div>
-    
-    <a href="/" class="button">Go Back</a>
-</body>
-</html>
-    '''
-    
-    # Write HTML files
-    with open(os.path.join(templates_dir, 'index.html'), 'w') as f:
-        f.write(index_html)
-    
-    with open(os.path.join(templates_dir, 'result.html'), 'w') as f:
-        f.write(result_html)
-    
-    with open(os.path.join(templates_dir, 'error.html'), 'w') as f:
-        f.write(error_html)
-    
-    print("✅ Templates created successfully")
-
-if __name__ == '__main__':
-    # Create templates
-    create_templates()
-    
-    # Load the model
-    load_model()
-    
-    # Run the app
-    app.run(debug=True, host='0.0.0.0', port=5000)
+# Footer
+st.markdown("---")
+st.markdown("### 📝 Notes")
+st.markdown("""
+- **Hard Rule**: Developers on leave are automatically not recommended
+- **Model**: Random Forest Classifier
+- **Features**: Project type, seniority requirements, developer skills, workload, etc.
+""")
