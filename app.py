@@ -2,15 +2,17 @@ import streamlit as st
 import pandas as pd
 import joblib
 
-# Load model and encoders
-model = joblib.load("dev_recommender_model.pkl")
-label_encoders = joblib.load("label_encoders.pkl")
+@st.cache_resource
+def load_artifacts():
+    model = joblib.load("dev_recommender_model.pkl")
+    label_encoders = joblib.load("label_encoders.pkl")
+    return model, label_encoders
+
+model, label_encoders = load_artifacts()
 
 st.title("👨‍💻 Developer Recommendation System")
-
 st.write("Fill the project & developer details below:")
 
-# Inputs
 project_type = st.selectbox("Project Type", ["web", "app", "game"])
 required_seniority = st.selectbox("Required Seniority", ["junior", "mid", "senior"])
 dev_specialty = st.selectbox("Developer Specialty", ["web", "app", "game"])
@@ -19,10 +21,9 @@ dev_workload = st.selectbox("Developer Workload", ["free", "light", "heavy"])
 dev_on_leave = st.checkbox("Developer On Leave?")
 dev_tasks_this_week = st.number_input("Tasks This Week", min_value=0, step=1)
 
-
 def predict_with_rules(sample):
-    # HARD RULE
-    if sample["dev_on_leave"] == True:
+
+    if sample["dev_on_leave"]:
         return 0
 
     temp = pd.DataFrame([sample])
@@ -31,8 +32,9 @@ def predict_with_rules(sample):
         if col in label_encoders:
             temp[col] = label_encoders[col].transform(temp[col])
 
-    return int(model.predict(temp)[0])
+    temp = temp[model.feature_names_in_]
 
+    return int(model.predict(temp)[0])
 
 if st.button("Predict"):
 
